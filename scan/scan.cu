@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -15,6 +16,18 @@
 #define THREADS_PER_BLOCK 256
 
 
+// Wraps a CUDA runtime call; on failure prints file, line, and error string, then exits.
+#define CUDA_CHECK(call)                                                      \
+    do {                                                                      \
+        cudaError_t err__ = (call);                                           \
+        if (err__ != cudaSuccess) {                                           \
+            fprintf(stderr, "CUDA error at %s:%d: %s\n",                      \
+                    __FILE__, __LINE__, cudaGetErrorString(err__));           \
+            exit(EXIT_FAILURE);                                               \
+        }                                                                     \
+    } while (0)
+
+
 // helper function to round an integer up to the next power of 2
 static inline int nextPow2(int n) {
     n--;
@@ -26,6 +39,43 @@ static inline int nextPow2(int n) {
     n++;
     return n;
 }
+
+
+// upsweep_kernel --
+//
+// One level of the up-sweep (reduce) phase. `twoD` is the stride for
+// this level (2, 4, 8, ...). Each of the `numThreads` active threads
+// owns one pair: the left child sits at i + twoD/2 - 1 and the parent
+// (right child) at i + twoD - 1, where i = threadIndex * twoD.
+__global__ void
+upsweep_kernel(int* data, int twoD, int numThreads) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= numThreads) return;
+
+    int i = idx * twoD;
+    data[i + twoD - 1] += data[i + twoD / 2 - 1];
+}
+
+
+// downsweep_kernel --
+//
+// One level of the down-sweep phase. Same indexing as the up-sweep,
+// but each thread does swap-and-add:
+//   t = left; left = parent; parent = parent + t   (using the old parent)
+__global__ void
+downsweep_kernel(int* data, int twoD, int numThreads) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= numThreads) return;
+
+    int i = idx * twoD;
+    int left  = i + twoD / 2 - 1;
+    int right = i + twoD - 1;
+
+    int t = data[left];
+    data[left] = data[right];
+    data[right] += t;
+}
+
 
 // exclusive_scan --
 //
@@ -42,19 +92,42 @@ static inline int nextPow2(int n) {
 // Also, as per the comments in cudaScan(), you can implement an
 // "in-place" scan, since the timing harness makes a copy of input and
 // places it in result
+//
+// This version is an in-place, work-efficient (up-sweep / down-sweep)
+// scan on `result`. `input` is not used because `result` already holds
+// a copy of the input values.
 void exclusive_scan(int* input, int N, int* result)
 {
+    if (N <= 0) return;
 
-    // CS149 TODO:
-    //
-    // Implement your exclusive scan implementation here.  Keep in
-    // mind that although the arguments to this function are device
-    // allocated arrays, this is a function that is running in a thread
-    // on the CPU.  Your implementation will need to make multiple calls
-    // to CUDA kernel functions (that you must write) to implement the
-    // scan.
+    // Work on the power-of-two padded length.
+    int rounded = nextPow2(N);
 
+    // Zero the padding (elements N .. rounded-1) so the scan never adds
+    // uninitialized memory. These values cannot affect results[0..N-1]
+    // in an exclusive scan, but zeroing avoids signed-overflow on garbage.
+    if (rounded > N) {
+        CUDA_CHECK(cudaMemset(result + N, 0, (size_t)(rounded - N) * sizeof(int)));
+    }
 
+    // ---- Up-sweep: build partial sums up the tree ----
+    for (int twoD = 2; twoD <= rounded; twoD *= 2) {
+        int numThreads = rounded / twoD;
+        int blocks = (numThreads + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+        upsweep_kernel<<<blocks, THREADS_PER_BLOCK>>>(result, twoD, numThreads);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    // ---- Set the root (last element) to 0 ----
+    CUDA_CHECK(cudaMemset(result + (rounded - 1), 0, sizeof(int)));
+
+    // ---- Down-sweep: push prefix sums back down the tree ----
+    for (int twoD = rounded; twoD >= 2; twoD /= 2) {
+        int numThreads = rounded / twoD;
+        int blocks = (numThreads + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+        downsweep_kernel<<<blocks, THREADS_PER_BLOCK>>>(result, twoD, numThreads);
+        CUDA_CHECK(cudaGetLastError());
+    }
 }
 
 
