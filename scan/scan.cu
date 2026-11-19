@@ -214,6 +214,39 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
 }
 
 
+// flags_kernel --
+//
+// One thread per index of the padded (power-of-two) array. flags[i] is 1
+// if input[i] == input[i+1], else 0. The `i < length - 1` test does two jobs:
+//   * i == length-1 has no right neighbour, so its flag is 0.
+//   * every padded index >= length gets flag 0, so uninitialized padding
+//     is never read and never contributes to the scan.
+// Because && short-circuits, input[i+1] is only read when i+1 < length.
+__global__ void
+flags_kernel(const int* input, int length, int rounded, int* flags) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rounded) return;
+
+    flags[i] = (i < length - 1 && input[i] == input[i + 1]) ? 1 : 0;
+}
+
+
+// scatter_kernel --
+//
+// One thread per i in 0 .. length-2. `scan` is the exclusive scan of the
+// flags, so scan[i] is the number of repeats before i, which is exactly the
+// output slot for index i if it is a repeat. The flags were overwritten by
+// the in-place scan, so the repeat test is redone from the (unmodified) input.
+__global__ void
+scatter_kernel(const int* input, int length, const int* scan, int* output) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= length - 1) return;
+
+    if (input[i] == input[i + 1])
+        output[scan[i]] = i;
+}
+
+
 // find_repeats --
 //
 // Given an array of integers `device_input`, returns an array of all
@@ -222,19 +255,37 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
 // Returns the total number of pairs found
 int find_repeats(int* device_input, int length, int* device_output) {
 
-    // CS149 TODO:
-    //
-    // Implement this function. You will probably want to
-    // make use of one or more calls to exclusive_scan(), as well as
-    // additional CUDA kernel launches.
-    //    
-    // Note: As in the scan code, the calling code ensures that
-    // allocated arrays are a power of 2 in size, so you can use your
-    // exclusive_scan function with them. However, your implementation
-    // must ensure that the results of find_repeats are correct given
-    // the actual array length.
+    // Fewer than two elements means there are no pairs to compare.
+    if (length < 2) return 0;
 
-    return 0; 
+    int rounded = nextPow2(length);
+
+    // Separate array for the flags: exclusive_scan works in place, so the
+    // scan overwrites it with the output slots.
+    int* device_flags = nullptr;
+    CUDA_CHECK(cudaMalloc((void**)&device_flags, (size_t)rounded * sizeof(int)));
+
+    // 1. Flags for the whole padded range (padding gets 0).
+    int flagBlocks = (rounded + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+    flags_kernel<<<flagBlocks, THREADS_PER_BLOCK>>>(device_input, length, rounded, device_flags);
+    CUDA_CHECK(cudaGetLastError());
+
+    // 2. In-place exclusive scan over the padded size.
+    exclusive_scan(device_flags, rounded, device_flags);
+
+    // 3. Scatter repeat indices into packed positions.
+    int scatterBlocks = ((length - 1) + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+    scatter_kernel<<<scatterBlocks, THREADS_PER_BLOCK>>>(device_input, length, device_flags, device_output);
+    CUDA_CHECK(cudaGetLastError());
+
+    // 4. Total count = scan[length-1] + flag[length-1]. The last flag is 0 by
+    // construction (no right neighbour), so scan[length-1] alone is the count.
+    // This blocking copy also waits for the kernels above to finish.
+    int count = 0;
+    CUDA_CHECK(cudaMemcpy(&count, device_flags + (length - 1), sizeof(int), cudaMemcpyDeviceToHost));
+
+    CUDA_CHECK(cudaFree(device_flags));
+    return count;
 }
 
 
