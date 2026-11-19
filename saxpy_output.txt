@@ -1,0 +1,14 @@
+---------------------------------------------------------
+Found 1 CUDA devices
+Device 0: Tesla T4
+   SMs:        40
+   Global mem: 14913 MB
+   CUDA Cap:   7.5
+---------------------------------------------------------
+Running 3 timing tests:
+Overall (copies + kernel): 276.570 ms	[4.041 GiB/s]
+Kernel only:               4.747 ms	[235.454 GiB/s]
+Overall (copies + kernel): 306.172 ms	[3.650 GiB/s]
+Kernel only:               4.667 ms	[239.468 GiB/s]
+Overall (copies + kernel): 291.968 ms	[3.828 GiB/s]
+Kernel only:               4.669 ms	[239.364 GiB/s]

@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -7,7 +8,19 @@
 #include "CycleTimer.h"
 
 
-// return GB/sec
+// Wraps a CUDA runtime call; on failure prints file, line, and error string, then exits.
+#define CUDA_CHECK(call)                                                      \
+    do {                                                                      \
+        cudaError_t err__ = (call);                                           \
+        if (err__ != cudaSuccess) {                                           \
+            fprintf(stderr, "CUDA error at %s:%d: %s\n",                      \
+                    __FILE__, __LINE__, cudaGetErrorString(err__));           \
+            exit(EXIT_FAILURE);                                               \
+        }                                                                     \
+    } while (0)
+
+
+// return GiB/sec (bytes / 2^30 / sec). Multiply by 1.0737 for GB/sec.
 float GBPerSec(int bytes, float sec) {
   return static_cast<float>(bytes) / (1024. * 1024. * 1024.) / sec;
 }
@@ -65,50 +78,54 @@ void saxpyCuda(int N, float alpha, float* xarray, float* yarray, float* resultar
     float* device_x = nullptr;
     float* device_y = nullptr;
     float* device_result = nullptr;
-    
-    //
-    // CS149 TODO: allocate device memory buffers on the GPU using cudaMalloc.
-    //
-    // We highly recommend taking a look at NVIDIA's
-    // tutorial, which clearly walks you through the few lines of code
-    // you need to write for this part of the assignment:
-    //
-    // https://devblogs.nvidia.com/easy-introduction-cuda-c-and-c/
-    //
-        
+
+    size_t bytes = sizeof(float) * N;
+
+    // Allocate device memory buffers (before either timer starts)
+    CUDA_CHECK(cudaMalloc((void**)&device_x, bytes));
+    CUDA_CHECK(cudaMalloc((void**)&device_y, bytes));
+    CUDA_CHECK(cudaMalloc((void**)&device_result, bytes));
+
     // start timing after allocation of device memory
+    // ---- overall timer: copy in + kernel + copy out ----
     double startTime = CycleTimer::currentSeconds();
 
-    //
-    // CS149 TODO: copy input arrays to the GPU using cudaMemcpy
-    //
+    // Copy input arrays host -> device (blocking)
+    CUDA_CHECK(cudaMemcpy(device_x, xarray, bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(device_y, yarray, bytes, cudaMemcpyHostToDevice));
 
-   
+    // ---- kernel-only timer ----
+    double kernelStart = CycleTimer::currentSeconds();
+
     // run CUDA kernel. (notice the <<< >>> brackets indicating a CUDA
     // kernel launch) Execution on the GPU occurs here.
     saxpy_kernel<<<blocks, threadsPerBlock>>>(N, alpha, device_x, device_y, device_result);
 
-    //
-    // CS149 TODO: copy result from GPU back to CPU using cudaMemcpy
-    //
+    CUDA_CHECK(cudaGetLastError());        // launch errors (bad config, etc.)
+    CUDA_CHECK(cudaDeviceSynchronize());   // wait for the kernel; also surfaces execution errors
 
-    
+    double kernelEnd = CycleTimer::currentSeconds();
+    // ---- end kernel-only timer ----
+
+    // Copy result device -> host (blocking)
+    CUDA_CHECK(cudaMemcpy(resultarray, device_result, bytes, cudaMemcpyDeviceToHost));
+
     // end timing after result has been copied back into host memory
     double endTime = CycleTimer::currentSeconds();
-
-    cudaError_t errCode = cudaPeekAtLastError();
-    if (errCode != cudaSuccess) {
-        fprintf(stderr, "WARNING: A CUDA error occured: code=%d, %s\n",
-		errCode, cudaGetErrorString(errCode));
-    }
+    // ---- end overall timer ----
 
     double overallDuration = endTime - startTime;
-    printf("Effective BW by CUDA saxpy: %.3f ms\t\t[%.3f GB/s]\n", 1000.f * overallDuration, GBPerSec(totalBytes, overallDuration));
+    double kernelDuration  = kernelEnd - kernelStart;
 
-    //
-    // CS149 TODO: free memory buffers on the GPU using cudaFree
-    //
-    
+    printf("Overall (copies + kernel): %.3f ms\t[%.3f GiB/s]\n",
+           1000.0 * overallDuration, GBPerSec(totalBytes, overallDuration));
+    printf("Kernel only:               %.3f ms\t[%.3f GiB/s]\n",
+           1000.0 * kernelDuration, GBPerSec(totalBytes, kernelDuration));
+
+    // Free device memory buffers (after timing)
+    CUDA_CHECK(cudaFree(device_x));
+    CUDA_CHECK(cudaFree(device_y));
+    CUDA_CHECK(cudaFree(device_result));
 }
 
 void printCudaInfo() {
