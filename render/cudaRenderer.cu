@@ -384,6 +384,9 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
 // Each thread renders a circle.  Since there is no protection to
 // ensure order of update or mutual exclusion on the output image, the
 // resulting image will be incorrect.
+//
+// NOTE: no longer used by render(); kept for reference. See
+// kernelRenderPixels below.
 __global__ void kernelRenderCircles() {
 
     int index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -424,6 +427,40 @@ __global__ void kernelRenderCircles() {
             shadePixel(index, pixelCenterNorm, p, imgPtr);
             imgPtr++;
         }
+    }
+}
+
+// kernelRenderPixels -- (CUDA device code)
+//
+// Each thread owns exactly one pixel and loops over all circles in
+// increasing index order.
+//   * Atomicity: no two threads ever touch the same pixel, so the
+//     read-modify-write in shadePixel needs no atomics.
+//   * Order: for a given pixel, circle i is always applied before
+//     circle i+1, matching the sequential reference.
+__global__ void kernelRenderPixels() {
+
+    int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
+    int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
+
+    int imageWidth = cuConstRendererParams.imageWidth;
+    int imageHeight = cuConstRendererParams.imageHeight;
+
+    if (pixelX >= imageWidth || pixelY >= imageHeight)
+        return;
+
+    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
+
+    // same pixel-centre formula as the starter kernelRenderCircles
+    float invWidth = 1.f / imageWidth;
+    float invHeight = 1.f / imageHeight;
+    float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
+                                         invHeight * (static_cast<float>(pixelY) + 0.5f));
+
+    int numCircles = cuConstRendererParams.numCircles;
+    for (int circle = 0; circle < numCircles; circle++) {
+        float3 p = *(float3*)(&cuConstRendererParams.position[3 * circle]);
+        shadePixel(circle, pixelCenterNorm, p, imgPtr);
     }
 }
 
@@ -633,13 +670,26 @@ CudaRenderer::advanceAnimation() {
     cudaDeviceSynchronize();
 }
 
+// render --
+//
+// One thread per pixel: launch a 2D grid covering the image.
 void
 CudaRenderer::render() {
 
-    // 256 threads per block is a healthy number
-    dim3 blockDim(256, 1);
-    dim3 gridDim((numCircles + blockDim.x - 1) / blockDim.x);
+    dim3 blockDim(16, 16, 1);
+    dim3 gridDim(
+        (image->width + blockDim.x - 1) / blockDim.x,
+        (image->height + blockDim.y - 1) / blockDim.y);
 
-    kernelRenderCircles<<<gridDim, blockDim>>>();
-    cudaDeviceSynchronize();
+    kernelRenderPixels<<<gridDim, blockDim>>>();
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "kernelRenderPixels launch error: %s\n", cudaGetErrorString(err));
+    }
+
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "kernelRenderPixels execution error: %s\n", cudaGetErrorString(err));
+    }
 }

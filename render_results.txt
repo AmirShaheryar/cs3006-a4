@@ -1,0 +1,24 @@
+== rgb -s 1024 ==
+***************** Correctness check passed **************************
+Total:    0.3278 ms
+== rgby -s 1024 ==
+***************** Correctness check passed **************************
+Total:    0.2473 ms
+== rand10k -s 1024 ==
+***************** Correctness check passed **************************
+Total:    48.2629 ms
+== biglittle -s 1024 ==
+***************** Correctness check passed **************************
+Total:    145.4873 ms
+== littlebig -s 1024 ==
+***************** Correctness check passed **************************
+Total:    145.4841 ms
+== pattern -s 1024 ==
+***************** Correctness check passed **************************
+Total:    6.2824 ms
+== snowsingle -s 1024 ==
+***************** Correctness check passed **************************
+Total:    462.1013 ms
+== rand100k -s 1024 ==
+***************** Correctness check passed **************************
+Total:    617.8766 ms
