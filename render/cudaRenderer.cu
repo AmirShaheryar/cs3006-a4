@@ -14,6 +14,13 @@
 #include "sceneLoader.h"
 #include "util.h"
 
+// 1 = tiled renderer (kernelRenderTiles), 0 = per-pixel renderer with
+// register accumulation (kernelRenderPixels). Handy for timing each step.
+#define RENDER_USE_TILES 1
+
+// Threads per block for the tiled kernel (a 16x16 block = one tile).
+#define BLOCKSIZE 256
+
 ////////////////////////////////////////////////////////////////////////////////////////
 // Putting all the cuda kernels here
 ///////////////////////////////////////////////////////////////////////////////////////
@@ -379,6 +386,60 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
     // END SHOULD-BE-ATOMIC REGION
 }
 
+// shadePixelReg -- (CUDA device code)
+//
+// Same math as shadePixel, but the pixel colour lives in registers: the
+// caller passes the current colour in and gets the blended colour back, so
+// there is no global read/write per circle. The circle radius and the
+// "is this a snowflake scene" decision are also passed in so they are not
+// re-read / re-tested inside the circle loop.
+__device__ __inline__ float4
+shadePixelReg(int circleIndex, float2 pixelCenter, float3 p, float rad,
+              float4 existingColor, bool snow) {
+
+    float diffX = p.x - pixelCenter.x;
+    float diffY = p.y - pixelCenter.y;
+    float pixelDist = diffX * diffX + diffY * diffY;
+
+    float maxDist = rad * rad;
+
+    // circle does not contribute to the image
+    if (pixelDist > maxDist)
+        return existingColor;
+
+    float3 rgb;
+    float alpha;
+
+    if (snow) {
+
+        const float kCircleMaxAlpha = .5f;
+        const float falloffScale = 4.f;
+
+        float normPixelDist = sqrt(pixelDist) / rad;
+        rgb = lookupColor(normPixelDist);
+
+        float maxAlpha = .6f + .4f * (1.f-p.z);
+        maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f); // kCircleMaxAlpha * clamped value
+        alpha = maxAlpha * exp(-1.f * falloffScale * normPixelDist * normPixelDist);
+
+    } else {
+        // simple: each circle has an assigned color
+        int index3 = 3 * circleIndex;
+        rgb = *(float3*)&(cuConstRendererParams.color[index3]);
+        alpha = .5f;
+    }
+
+    float oneMinusAlpha = 1.f - alpha;
+
+    float4 newColor;
+    newColor.x = alpha * rgb.x + oneMinusAlpha * existingColor.x;
+    newColor.y = alpha * rgb.y + oneMinusAlpha * existingColor.y;
+    newColor.z = alpha * rgb.z + oneMinusAlpha * existingColor.z;
+    newColor.w = alpha + existingColor.w;
+
+    return newColor;
+}
+
 // kernelRenderCircles -- (CUDA device code)
 //
 // Each thread renders a circle.  Since there is no protection to
@@ -434,10 +495,10 @@ __global__ void kernelRenderCircles() {
 //
 // Each thread owns exactly one pixel and loops over all circles in
 // increasing index order.
-//   * Atomicity: no two threads ever touch the same pixel, so the
-//     read-modify-write in shadePixel needs no atomics.
-//   * Order: for a given pixel, circle i is always applied before
-//     circle i+1, matching the sequential reference.
+//   * Atomicity: no two threads ever touch the same pixel, so no atomics.
+//   * Order: for a given pixel, circle i is always applied before i+1.
+//   * The pixel colour is read once before the loop, blended in registers
+//     by shadePixelReg, and written back once after the loop.
 __global__ void kernelRenderPixels() {
 
     int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
@@ -457,11 +518,144 @@ __global__ void kernelRenderPixels() {
     float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
                                          invHeight * (static_cast<float>(pixelY) + 0.5f));
 
+    // decide the scene type once, not per circle
+    const bool snow = (cuConstRendererParams.sceneName == SNOWFLAKES ||
+                       cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME);
+
+    float4 color = *imgPtr;
+
     int numCircles = cuConstRendererParams.numCircles;
     for (int circle = 0; circle < numCircles; circle++) {
         float3 p = *(float3*)(&cuConstRendererParams.position[3 * circle]);
-        shadePixel(circle, pixelCenterNorm, p, imgPtr);
+        float rad = cuConstRendererParams.radius[circle];
+        color = shadePixelReg(circle, pixelCenterNorm, p, rad, color, snow);
     }
+
+    *imgPtr = color;
+}
+
+// circleOverlapsBox -- (CUDA device code)
+//
+// Exact circle/box test: clamp the circle centre to the box to get the
+// closest point of the box, then compare that distance with the radius.
+// Never returns 0 for a circle that touches any point inside the box.
+__device__ __inline__ bool
+circleOverlapsBox(float cx, float cy, float r,
+                  float boxL, float boxR, float boxB, float boxT) {
+    float closestX = fminf(fmaxf(cx, boxL), boxR);
+    float closestY = fminf(fmaxf(cy, boxB), boxT);
+    float dx = closestX - cx;
+    float dy = closestY - cy;
+    return (dx * dx + dy * dy) <= r * r;
+}
+
+// kernelRenderTiles -- (CUDA device code)
+//
+// One 16x16 block = one tile of the image, one thread per pixel.
+// The block walks the circle list in chunks of BLOCKSIZE circles. Per chunk:
+//   1. each thread tests one circle against the tile box -> flag (0/1)
+//   2. exclusive scan of the flags gives each flagged circle its slot
+//      (warp-level scan with ballot+popc, then a prefix over the 8 warp counts)
+//   3. flagged circles are compacted into shared memory, in index order
+//   4. every thread shades its own pixel with the compacted circles, in order
+// Order is preserved because slots increase with circle index and chunks
+// are processed in increasing order. No thread ever returns early, because
+// every thread must reach every __syncthreads() / __ballot_sync().
+__global__ void kernelRenderTiles() {
+
+    __shared__ int    sIdx[BLOCKSIZE];
+    __shared__ float3 sPos[BLOCKSIZE];
+    __shared__ float  sRad[BLOCKSIZE];
+    __shared__ int    sWarpCount[BLOCKSIZE / 32];
+
+    const int tid  = threadIdx.y * blockDim.x + threadIdx.x;   // 0 .. 255
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+
+    const int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
+    const int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
+
+    const int imageWidth  = cuConstRendererParams.imageWidth;
+    const int imageHeight = cuConstRendererParams.imageHeight;
+    const int numCircles  = cuConstRendererParams.numCircles;
+
+    const bool inImage = (pixelX < imageWidth && pixelY < imageHeight);
+
+    const float invWidth  = 1.f / imageWidth;
+    const float invHeight = 1.f / imageHeight;
+
+    // Tile box in normalized coordinates. It spans the full 16x16 pixel
+    // area, so it extends half a pixel beyond the outermost pixel centres.
+    // That margin makes the test safely conservative against rounding:
+    // any pixel centre inside a circle puts the circle inside this box test.
+    const float boxL = invWidth  * static_cast<float>(blockIdx.x * blockDim.x);
+    const float boxR = invWidth  * static_cast<float>((blockIdx.x + 1) * blockDim.x);
+    const float boxB = invHeight * static_cast<float>(blockIdx.y * blockDim.y);
+    const float boxT = invHeight * static_cast<float>((blockIdx.y + 1) * blockDim.y);
+
+    float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
+                                         invHeight * (static_cast<float>(pixelY) + 0.5f));
+
+    const bool snow = (cuConstRendererParams.sceneName == SNOWFLAKES ||
+                       cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME);
+
+    float4* imgPtr = NULL;
+    float4 color = make_float4(0.f, 0.f, 0.f, 0.f);
+    if (inImage) {
+        imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
+        color = *imgPtr;
+    }
+
+    for (int chunkStart = 0; chunkStart < numCircles; chunkStart += BLOCKSIZE) {
+
+        // 1. overlap test: thread tid handles circle chunkStart + tid
+        int circle = chunkStart + tid;
+        int flag = 0;
+        float3 p = make_float3(0.f, 0.f, 0.f);
+        float rad = 0.f;
+        if (circle < numCircles) {
+            p = *(float3*)(&cuConstRendererParams.position[3 * circle]);
+            rad = cuConstRendererParams.radius[circle];
+            flag = circleOverlapsBox(p.x, p.y, rad, boxL, boxR, boxB, boxT) ? 1 : 0;
+        }
+
+        // 2. exclusive scan of the flags
+        //    within a warp: rank = number of flagged lanes below this one
+        unsigned int mask = __ballot_sync(0xffffffffu, flag);
+        int rankInWarp = __popc(mask & ((1u << lane) - 1u));
+        if (lane == 0)
+            sWarpCount[warp] = __popc(mask);
+        __syncthreads();
+
+        //    across warps: prefix over the 8 warp counts, plus the chunk total
+        int warpOffset = 0;
+        int total = 0;
+        #pragma unroll
+        for (int w = 0; w < BLOCKSIZE / 32; w++) {
+            if (w < warp) warpOffset += sWarpCount[w];
+            total += sWarpCount[w];
+        }
+
+        // 3. compact the flagged circles into shared memory, in order
+        if (flag) {
+            int slot = warpOffset + rankInWarp;
+            sIdx[slot] = circle;
+            sPos[slot] = p;
+            sRad[slot] = rad;
+        }
+        __syncthreads();
+
+        // 4. shade this pixel with the chunk's overlapping circles, in order
+        if (inImage) {
+            for (int k = 0; k < total; k++) {
+                color = shadePixelReg(sIdx[k], pixelCenterNorm, sPos[k], sRad[k], color, snow);
+            }
+        }
+        __syncthreads();   // shared arrays are reused by the next chunk
+    }
+
+    if (inImage)
+        *imgPtr = color;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////
@@ -672,7 +866,8 @@ CudaRenderer::advanceAnimation() {
 
 // render --
 //
-// One thread per pixel: launch a 2D grid covering the image.
+// Launch a 2D grid of 16x16 blocks covering the image: one thread per pixel.
+// RENDER_USE_TILES picks the tiled kernel (default) or the per-pixel one.
 void
 CudaRenderer::render() {
 
@@ -681,15 +876,19 @@ CudaRenderer::render() {
         (image->width + blockDim.x - 1) / blockDim.x,
         (image->height + blockDim.y - 1) / blockDim.y);
 
+#if RENDER_USE_TILES
+    kernelRenderTiles<<<gridDim, blockDim>>>();
+#else
     kernelRenderPixels<<<gridDim, blockDim>>>();
+#endif
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-        fprintf(stderr, "kernelRenderPixels launch error: %s\n", cudaGetErrorString(err));
+        fprintf(stderr, "render kernel launch error: %s\n", cudaGetErrorString(err));
     }
 
     err = cudaDeviceSynchronize();
     if (err != cudaSuccess) {
-        fprintf(stderr, "kernelRenderPixels execution error: %s\n", cudaGetErrorString(err));
+        fprintf(stderr, "render kernel execution error: %s\n", cudaGetErrorString(err));
     }
 }
