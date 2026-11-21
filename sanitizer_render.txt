@@ -1,0 +1,78 @@
+========= COMPUTE-SANITIZER
+Rendering to 256x256 image
+Loaded scene with 10000 circles
+Loaded scene with 10000 circles
+---------------------------------------------------------
+Initializing CUDA for CudaRenderer
+Found 1 CUDA devices
+Device 0: Tesla T4
+   SMs:        40
+   Global mem: 14913 MB
+   CUDA Cap:   7.5
+---------------------------------------------------------
+
+Running benchmark, 1 frames, beginning at frame 0 ...
+Dumping frames to /tmp/san_xxx.ppm
+Copying image data from device
+Wrote image file /tmp/san_0000.ppm
+Copying image data from device
+***************** Correctness check passed **************************
+Clear:    0.5655 ms
+Advance:  0.0193 ms
+Render:   62.9562 ms
+Total:    63.5411 ms
+File IO:  5.0341 ms
+
+Overall:  0.1056 sec (note units are seconds)
+========= ERROR SUMMARY: 0 errors
+========= COMPUTE-SANITIZER
+Rendering to 256x256 image
+Loaded scene with 10000 circles
+Loaded scene with 10000 circles
+---------------------------------------------------------
+Initializing CUDA for CudaRenderer
+Found 1 CUDA devices
+Device 0: Tesla T4
+   SMs:        40
+   Global mem: 14913 MB
+   CUDA Cap:   7.5
+---------------------------------------------------------
+
+Running benchmark, 1 frames, beginning at frame 0 ...
+Dumping frames to /tmp/san_xxx.ppm
+Copying image data from device
+Wrote image file /tmp/san_0000.ppm
+Copying image data from device
+***************** Correctness check passed **************************
+Clear:    0.7379 ms
+Advance:  0.0289 ms
+Render:   521.8435 ms
+Total:    522.6103 ms
+File IO:  5.3248 ms
+
+Overall:  1.0042 sec (note units are seconds)
+========= ERROR SUMMARY: 0 errors
+========= COMPUTE-SANITIZER
+Rendering to 256x256 image
+Loaded scene with 10000 circles
+---------------------------------------------------------
+Initializing CUDA for CudaRenderer
+Found 1 CUDA devices
+Device 0: Tesla T4
+   SMs:        40
+   Global mem: 14913 MB
+   CUDA Cap:   7.5
+---------------------------------------------------------
+
+Running benchmark, 1 frames, beginning at frame 0 ...
+Dumping frames to /tmp/san_xxx.ppm
+Copying image data from device
+Wrote image file /tmp/san_0000.ppm
+Clear:    9.9750 ms
+Advance:  0.0092 ms
+Render:   15075.3911 ms
+Total:    15085.3753 ms
+File IO:  5.3064 ms
+
+Overall:  15.0907 sec (note units are seconds)
+========= RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings)
